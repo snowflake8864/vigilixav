@@ -3,6 +3,11 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ARCH=$(uname -m)
+# ====== 平台选择（通过 VERSION 第 6 位数字区分，即 "1.1.1" 后的第 1 位）======
+#   1 = x86_64       例: 1.1.1132
+#   2 = aarch64      例: 1.1.1232 
+#   3 = loongarch64  例: 1.1.1332
+#   4 = mips64el     例: 1.1.1432
 
 VERSION="1.1.1136"
 CUSTOM_VERSION=""
