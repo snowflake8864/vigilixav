@@ -1,0 +1,10 @@
+VIGILIXAV_PRIVATE {
+	global:
+		libvigilixunrar_iface_LTX_unrar_open;
+		libvigilixunrar_iface_LTX_unrar_peek_file_header;
+		libvigilixunrar_iface_LTX_unrar_extract_file;
+		libvigilixunrar_iface_LTX_unrar_skip_file;
+		libvigilixunrar_iface_LTX_unrar_close;
+	local:
+		*;
+};

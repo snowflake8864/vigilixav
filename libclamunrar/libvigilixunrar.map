@@ -1,0 +1,10 @@
+VIGILIXAV_PRIVATE_UNRAR {
+	global:
+		RARProcessFile;
+		RARCloseArchive;
+		RARSetCallback;
+		RARReadHeaderEx;
+		RAROpenArchiveEx;
+	local:
+		*;
+};

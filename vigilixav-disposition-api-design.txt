@@ -1,0 +1,252 @@
+=vigilixav 病毒处置 API 设计方案
+================================================================================
+
+1. 概述
+--------
+在 clamd/vigilixd 的 socket 协议中新增 MOVE（隔离）和 REMOVE（删除）两条命令，
+允许客户端通过 TCP/Unix socket 调用，复用 actions.c 中已有的安全文件操作逻辑。
+
+与现有扫描 API 的关系：
+  - 扫描路径不变（INSTREAM / SCAN / MULTISCAN 仍只返回结果）
+  - 处置是独立的后续步骤，Rust agent 扫描完发现病毒后，再调用处置命令
+  - 对现有的扫描流程零影响
+
+
+2. 协议格式
+-----------
+协议风格与现有 vigilixd 协议一致：以 null 结尾('\0')或换行('\n')的命令，返回纯文本。
+
+2.1 MOVE — 移动文件到隔离目录
+    请求:
+        nMOVE <quarantine_dir>/0<file_path>/0
+    或 (以 \n 结尾):
+        nMOVE <quarantine_dir>\n<file_path>\n
+    或 (目录可预先配置，简化调用):
+        nMOVE <file_path>/0
+
+    成功响应:
+        <file_path>: MOVED OK
+    失败响应:
+        <file_path>: Can't move file to <quarantine_dir>. ERROR
+
+2.2 REMOVE — 删除感染文件
+    请求:
+        nREMOVE <file_path>/0
+    或 (以 \n 结尾):
+        nREMOVE <file_path>\n
+
+    成功响应:
+        <file_path>: REMOVED OK
+    失败响应:
+        <file_path>: Can't remove file. ERROR
+
+
+3. 涉及文件改动
+-----------------
+
+3.1 clamd/session.h — 新增命令定义
+
+    // 命令字符串 (在 CMD26-27)
+    #define CMD26 "MOVE"
+    #define CMD27 "REMOVE"
+
+    // 命令枚举 (在 enum commands 里新增)
+    COMMAND_MOVE,
+    COMMAND_REMOVE,
+
+3.2 clamd/session.c — 核心实现
+
+    3.2.1 命令注册表 (commands[] 数组)
+         在 ALLMATCHSCAN 之后增加:
+         {CMD26, sizeof(CMD26) - 1, COMMAND_MOVE,    1, 1, 1},
+         {CMD27, sizeof(CMD27) - 1, COMMAND_REMOVE,  1, 1, 1},
+         参数说明: need_arg=1, support_old=1, enabled=1
+         (need_arg=1 表示需要文件路径参数)
+
+    3.2.2 命令分发 (command() 函数 switch-case)
+         新增 case COMMAND_MOVE 和 case COMMAND_REMOVE，
+         不在原有的扫描分支里，独立处理：
+
+         case COMMAND_MOVE: {
+             char *quarantine_dir;
+             // 如果命令格式带两个参数: "MOVE <dir>/0<file>/0"
+             // 第一个 null 前是 quarantine_dir，之后是 file_path
+             // 或从配置文件读取默认 quarantine_dir，命令只传文件路径
+
+             if (!optget(opts, "EnableMove")->enabled) {
+                 conn_reply_error(conn, "MOVE command is disabled");
+                 return 1;
+             }
+
+             // 调用公共安全 API（内部用 traverse_rename）
+             if (0 == action_move_file(conn->filename, quarantine_dir)) {
+                 conn_reply_single(conn, conn->filename, "MOVED OK");
+             } else {
+                 conn_reply(conn, conn->filename, "Can't move file", "ERROR");
+             }
+             return 0;
+         }
+
+         case COMMAND_REMOVE: {
+             if (!optget(opts, "EnableRemove")->enabled) {
+                 conn_reply_error(conn, "REMOVE command is disabled");
+                 return 1;
+             }
+
+             if (0 == action_remove_file(conn->filename)) {
+                 conn_reply_single(conn, conn->filename, "REMOVED OK");
+             } else {
+                 conn_reply(conn, conn->filename, "Can't remove file", "ERROR");
+             }
+             return 0;
+         }
+
+3.3 common/actions.c — 新增公共 API
+
+    当前 actions.c 中的 traverse_rename()、traverse_unlink()、getdest() 都是 static，
+    不能在外部直接调用。需新增两个公开函数：
+
+    /**
+     * @brief Move a file to quarantine directory using safe (symlink-immune) traverse.
+     * @param filepath    Source file path.
+     * @param destdir     Destination directory path.
+     * @return 0 on success, -1 on failure.
+     */
+    int action_move_file(const char *filepath, const char *destdir)
+    {
+        char *newname = NULL;
+        int fd = getdest(filepath, &newname);  // 需修改 getdest 接受 destdir 参数
+        int ret = -1;
+
+        if (fd < 0) goto done;
+        if (0 != traverse_rename(filepath, newname)) {
+            // rename 失败（跨文件系统），尝试 copy + delete
+            if (filecopy(filepath, newname) || traverse_unlink(filepath))
+                goto done;
+        }
+        ret = 0;
+    done:
+        if (newname) free(newname);
+        if (fd >= 0) close(fd);
+        return ret;
+    }
+
+    /**
+     * @brief Remove (delete) a file using safe (symlink-immune) traverse.
+     * @param filepath    File path to delete.
+     * @return 0 on success, -1 on failure.
+     */
+    int action_remove_file(const char *filepath)
+    {
+        return traverse_unlink(filepath);
+    }
+
+    同时需要:
+    - 修改 getdest() 签名，接受外部传入的 destdir 参数
+    - 将 traverse_rename、traverse_unlink 从 static 移除
+    - 或将新的公共包装函数直接留在 actions.c 中
+
+3.4 common/actions.h — 新增函数声明
+
+    int action_move_file(const char *filepath, const char *destdir);
+    int action_remove_file(const char *filepath);
+
+3.5 vigilixd session.c — include 现有
+
+    session.c 已通过 vigilixd_others.h -> misc.h -> actions.h 的路径间接引入 action()，
+    新增的 action_move_file / action_remove_file 声明在 actions.h 中可直接使用。
+
+3.6 clamd/vigilixd.c (optparser) — 新增配置项
+
+    + "EnableMove",         "yes",  0,  OPT_BOOL, ...   // 是否启用 MOVE 命令
+    + "EnableRemove",       "yes",  0,  OPT_BOOL, ...   // 是否启用 REMOVE 命令
+    + "MoveDirectory",      "",     0,  OPT_STRING, ... // 隔离文件目标目录（MOVE 可用）
+
+    配置项建议默认 EnableMove=no、EnableRemove=no，需要管理员显式开启。
+
+3.7 etc/vigilixd.conf.sample — 新增配置示例
+
+    # Enable the MOVE command to allow clients to move infected files to quarantine.
+    # Default: no
+    #EnableMove no
+
+    # Target directory for the MOVE command (quarantine).
+    #MoveDirectory /opt/vigilixav/quarantine
+
+    # Enable the REMOVE command to allow clients to delete infected files.
+    # Default: no
+    #EnableRemove no
+
+
+4. 安全设计
+-----------
+
+4.1 防符号链接穿越
+    复用 actions.c 中 traverse_to() + renameat(AT_FDCWD)/unlinkat() 的逻辑。
+    路径中的每一级目录都用 openat(O_NOFOLLOW) 打开，确保不会因恶意软链接
+    而操作到目标目录外的文件。
+
+4.2 权限检查
+    命令可通过 vigilixd 配置控制：
+    - EnableMove / EnableRemove 控制是否允许客户端调用
+    - MoveDirectory 限制 MOVE 只能移动到指定隔离目录
+    - TCP 连接可单独禁止处置命令（建议只允许 Unix socket）
+
+4.3 处置命令不依赖扫描上下文
+    处置命令接收的是文件路径字符串，不要求先扫描过该文件。
+    这样可以:
+    - 扫描后由 Rust agent 决策是否处置
+    - 支持手动指定要隔离/删除的文件（如管理员远程操作）
+
+
+5. Rust gRPC 侧集成方式
+-------------------------
+
+5.1 现有流程（只告警不动文件）
+    INSTREAM 扫描 → FOUND → 发送 VirusAlert gRPC 消息 → 上报 HTTP API
+
+5.2 新增处置流程
+    INSTREAM 扫描 → FOUND → 根据策略决定:
+    │
+    ├─ 告警     → 仅上报（现有逻辑）
+    ├─ 隔离     → invoke_disposition("MOVE", filepath, quarantine_dir)
+    └─ 删除     → invoke_disposition("REMOVE", filepath)
+
+5.3 Rust 侧需实现的内容
+    - 在 vigilixav_scanner.rs 中新增 disposition() 方法
+    - 打开到 vigilixd 的 socket，发送 "MOVE dir\0filepath\0" 或 "REMOVE filepath\0"
+    - 读取响应确认操作成功
+    - 在 scan_task_mgr.rs 中，ScanAction 枚举需要扩展：
+      ScanAction::Virus(name) → 处置决策 → 调 disposition()
+
+5.4 策略配置
+    config/src/net_info.rs 中新增字段:
+    - vigilixav_disposition_mode: "none" | "report" | "quarantine" | "remove"
+    - vigilixav_quarantine_dir: "/opt/vigilixav/quarantine"
+
+
+6. 改动总结
+-----------
+                     文件                   |  改动量
+   -----------------------------------------+---------
+   clamd/session.h                          |  +6 行
+   clamd/session.c                          | +40 行
+   common/actions.c                         | +30 行（新增公共 API 封装）
+   common/actions.h                         |  +4 行
+   clamd/vigilixd.c (optparser)                |  +6 行
+   etc/vigilixd.conf.sample                    |  +8 行
+   vigilixav_scanner.rs                     | +25 行（新增 disposition 方法）
+   scan_task_mgr.rs                         | +20 行（处置决策逻辑）
+   config/net_info.rs                       |  +8 行（配置字段）
+   -----------------------------------------+---------
+                                            | ~147 行
+
+
+7. 实现顺序建议
+-----------------
+   1. C 侧: actions.c/h → session.h → session.c → optparser → conf.sample
+   2. C 侧: ./build.sh 编译验证
+   3. C 侧: 用 nc/echo 测试协议命令
+   4. Rust 侧: vigilixav_scanner.rs 新增 disposition()
+   5. Rust 侧: scan_task_mgr.rs + config 新增处置策略
+   6. 集成测试: 放一个 EICAR 文件，全链路验证
